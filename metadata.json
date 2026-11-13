@@ -1,0 +1,8 @@
+{
+  "name": "AgendaFlex",
+  "description": "Sistema de gestão de clínicas focado em eficiência operacional, validação de conflitos de agenda, prontuário de atendimento e conformidade com a LGPD.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
