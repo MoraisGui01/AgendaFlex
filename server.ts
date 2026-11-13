@@ -1,15 +1,71 @@
 import express, { Request, Response, NextFunction } from 'express';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { createServer as createViteServer } from 'vite';
 import { z } from 'zod';
 import { CLINICA_PADRAO_ID, getDb, registrarAuditoria } from './server/db.ts';
 
 const PORT = 3000;
 
-function getOperator(req: Request): string {
-  const header = req.header('x-operator-name');
-  return header && header.trim().length > 0 ? header.trim().slice(0, 80) : 'Dra. Camila Mendes (Admin)';
+interface AuthUser {
+  uid: string;
+  email: string;
+  name: string;
+}
+
+interface AuthenticatedRequest extends Request {
+  authUser?: AuthUser;
+}
+
+const firebaseConfigRaw = JSON.parse(
+  fs.readFileSync(path.resolve(process.cwd(), 'firebase-applet-config.json'), 'utf8')
+) as { projectId: string };
+const FIREBASE_PROJECT_ID = firebaseConfigRaw.projectId;
+const FIREBASE_ISSUER = `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`;
+const FIREBASE_JWKS = createRemoteJWKSet(
+  new URL('https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com')
+);
+
+async function requireFirebaseAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  const authHeader = req.header('authorization') ?? '';
+  if (!authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Não autorizado. Faça login com sua conta Google.' });
+  }
+  const token = authHeader.slice(7).trim();
+  if (!token) {
+    return res.status(401).json({ error: 'Não autorizado. Token de sessão ausente.' });
+  }
+
+  try {
+    const { payload } = await jwtVerify(token, FIREBASE_JWKS, {
+      issuer: FIREBASE_ISSUER,
+      audience: FIREBASE_PROJECT_ID,
+    });
+    if (typeof payload.sub !== 'string' || payload.sub.length === 0) {
+      return res.status(401).json({ error: 'Sessão inválida. Faça login novamente.' });
+    }
+    req.authUser = {
+      uid: payload.sub,
+      email: typeof payload.email === 'string' ? payload.email : '',
+      name: typeof payload.name === 'string' ? payload.name : '',
+    };
+    return next();
+  } catch {
+    return res.status(401).json({ error: 'Sessão expirada ou inválida. Faça login novamente com o Google.' });
+  }
+}
+
+function getOperator(req: AuthenticatedRequest): string {
+  if (req.authUser) {
+    const { name, email, uid } = req.authUser;
+    if (name && email) return `${name} (${email})`.slice(0, 120);
+    if (name) return name.slice(0, 120);
+    if (email) return email.slice(0, 120);
+    return uid.slice(0, 120);
+  }
+  return 'Operador Autenticado';
 }
 
 function parseMinutes(hhmm: string): number {
@@ -27,16 +83,31 @@ function extractTime(iso: string): string {
   return iso.slice(11, 16);
 }
 
+function isValidCalendarDate(dateStr: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return false;
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const dt = new Date(y, m - 1, d);
+  return dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d;
+}
+
+function isValidClockTime(hhmm: string): boolean {
+  if (!/^\d{2}:\d{2}$/.test(hhmm)) return false;
+  const [h, m] = hhmm.split(':').map(Number);
+  return h >= 0 && h <= 23 && m >= 0 && m <= 59;
+}
+
 // Validation schemas
+const clockTimeSchema = z.string().refine(isValidClockTime, 'Horário inválido (use HH:MM entre 00:00 e 23:59)');
+
 const localSchema = z.object({
   nome: z.string().trim().min(2, 'Nome do local é obrigatório'),
   endereco: z.string().trim().min(5, 'Endereço é obrigatório'),
   horario_func: z
     .object({
-      abertura: z.string().regex(/^\d{2}:\d{2}$/),
-      fechamento: z.string().regex(/^\d{2}:\d{2}$/),
-      intervalo_inicio: z.string().regex(/^\d{2}:\d{2}$/).optional(),
-      intervalo_fim: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+      abertura: clockTimeSchema,
+      fechamento: clockTimeSchema,
+      intervalo_inicio: clockTimeSchema.optional(),
+      intervalo_fim: clockTimeSchema.optional(),
       dias: z.array(z.number().int().min(0).max(6)).min(1),
     })
     .refine((h) => parseMinutes(h.fechamento) > parseMinutes(h.abertura), {
@@ -53,24 +124,26 @@ const localSchema = z.object({
 });
 
 const profissionalSchema = z.object({
-  nome: z.string().min(2, 'Nome do profissional é obrigatório'),
-  cpf: z.string().min(11, 'CPF inválido'),
-  registro_conselho: z.string().optional().default(''),
-  especialidade: z.string().min(2, 'Especialidade é obrigatória'),
+  nome: z.string().trim().min(2, 'Nome do profissional é obrigatório'),
+  cpf: z.string().trim().min(11, 'CPF inválido'),
+  registro_conselho: z.string().trim().optional().default(''),
+  especialidade: z.string().trim().min(2, 'Especialidade é obrigatória'),
   status: z.enum(['ativo', 'inativo']).default('ativo'),
   procedimentos_vinculados: z.array(z.string()).default([]),
 });
 
 const clienteSchema = z.object({
-  nome: z.string().min(2, 'Nome do cliente é obrigatório'),
-  whatsapp: z.string().min(8, 'WhatsApp é obrigatório'),
-  nascimento: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Data de nascimento inválida'),
+  nome: z.string().trim().min(2, 'Nome do cliente é obrigatório'),
+  whatsapp: z.string().trim().min(8, 'WhatsApp é obrigatório'),
+  nascimento: z
+    .string()
+    .refine(isValidCalendarDate, 'Data de nascimento inválida (use YYYY-MM-DD real)'),
   lgpd_consentimento: z.boolean().default(true),
   status: z.enum(['ativo', 'inativo']).default('ativo'),
 });
 
 const procedimentoSchema = z.object({
-  nome: z.string().min(2, 'Nome do procedimento é obrigatório'),
+  nome: z.string().trim().min(2, 'Nome do procedimento é obrigatório'),
   duracao_min: z.number().int().positive('Duração deve ser maior que zero'),
   valor: z.number().nonnegative('Valor não pode ser negativo'),
   orientacoes: z.string().optional().default(''),
@@ -82,16 +155,22 @@ const agendamentoCreateSchema = z.object({
   profissional_id: z.string().min(1),
   local_id: z.string().min(1),
   procedimento_id: z.string().min(1),
-  data_hora_inicio: z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/),
+  data_hora_inicio: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/, 'Formato de data/hora inválido')
+    .refine(
+      (v) => isValidCalendarDate(v.slice(0, 10)) && isValidClockTime(v.slice(11, 16)),
+      'Data ou horário inexistente no calendário'
+    ),
   origem: z.enum(['recepcao', 'whatsapp', 'portal', 'lista_espera']).default('recepcao'),
   observacoes: z.string().optional().default(''),
 });
 
 const extraProcSchema = z.object({
   procedimento_id: z.string().nullable().optional(),
-  nome_procedimento: z.string().min(2),
-  duracao_min: z.number().int().positive(),
-  valor: z.number().nonnegative(),
+  nome_procedimento: z.string().trim().min(2, 'Descrição do procedimento extra é obrigatória'),
+  duracao_min: z.number().int().positive('Duração adicional deve ser maior que zero'),
+  valor: z.number().nonnegative('Valor adicional não pode ser negativo'),
 });
 
 const listaEsperaSchema = z.object({
@@ -99,7 +178,7 @@ const listaEsperaSchema = z.object({
   profissional_id: z.string().min(1),
   procedimento_id: z.string().min(1),
   local_id: z.string().min(1),
-  data_desejada: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  data_desejada: z.string().refine(isValidCalendarDate, 'Data desejada inválida'),
   observacoes: z.string().optional().default(''),
 });
 
@@ -109,9 +188,34 @@ async function startServer() {
 
   const db = getDb();
 
-  // Health
+  // Health (publico)
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, service: 'AgendaFlex API' });
+  });
+
+  // Todas as rotas de negocio exigem sessao Google (Firebase ID Token valido)
+  app.use('/api', requireFirebaseAuth);
+
+  // Auditoria de login / logoff Google
+  app.post('/api/auth/audit', (req: AuthenticatedRequest, res) => {
+    const schema = z.object({
+      evento: z.enum(['LOGIN_GOOGLE', 'LOGOFF_GOOGLE']),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Evento de autenticação inválido.' });
+    }
+    registrarAuditoria(db, {
+      usuario: getOperator(req),
+      acao: parsed.data.evento,
+      entidade: 'autenticacao',
+      entidade_id: req.authUser?.uid ?? 'desconhecido',
+      detalhes: {
+        email: req.authUser?.email ?? '',
+        provedor: 'google.com',
+      },
+    });
+    res.status(201).json({ ok: true });
   });
 
   // ---------------- LOCAIS ----------------
@@ -184,21 +288,23 @@ async function startServer() {
       status: d.status ?? existing.status,
     };
 
-    db.prepare(`UPDATE locais SET nome = ?, endereco = ?, horario_func = ?, status = ? WHERE id = ?`).run(
-      updated.nome,
-      updated.endereco,
-      updated.horario_func,
-      updated.status,
-      req.params.id
-    );
+    db.transaction(() => {
+      db.prepare(`UPDATE locais SET nome = ?, endereco = ?, horario_func = ?, status = ? WHERE id = ?`).run(
+        updated.nome,
+        updated.endereco,
+        updated.horario_func,
+        updated.status,
+        req.params.id
+      );
 
-    registrarAuditoria(db, {
-      usuario: getOperator(req),
-      acao: d.status && d.status !== existing.status ? `STATUS_LOCAL_${d.status.toUpperCase()}` : 'ATUALIZACAO_LOCAL',
-      entidade: 'locais',
-      entidade_id: req.params.id,
-      detalhes: { nome: updated.nome, status: updated.status },
-    });
+      registrarAuditoria(db, {
+        usuario: getOperator(req),
+        acao: d.status && d.status !== existing.status ? `STATUS_LOCAL_${d.status.toUpperCase()}` : 'ATUALIZACAO_LOCAL',
+        entidade: 'locais',
+        entidade_id: req.params.id,
+        detalhes: { nome: updated.nome, status: updated.status },
+      });
+    })();
 
     res.json({
       ...existing,
@@ -264,28 +370,30 @@ async function startServer() {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
     const d = parsed.data;
-    db.prepare(
-      `INSERT INTO profissionais (id, clinica_id, nome, cpf, registro_conselho, especialidade, status, procedimentos_vinculados, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      id,
-      CLINICA_PADRAO_ID,
-      d.nome,
-      d.cpf,
-      d.registro_conselho,
-      d.especialidade,
-      d.status,
-      JSON.stringify(d.procedimentos_vinculados),
-      now
-    );
+    db.transaction(() => {
+      db.prepare(
+        `INSERT INTO profissionais (id, clinica_id, nome, cpf, registro_conselho, especialidade, status, procedimentos_vinculados, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        id,
+        CLINICA_PADRAO_ID,
+        d.nome,
+        d.cpf,
+        d.registro_conselho,
+        d.especialidade,
+        d.status,
+        JSON.stringify(d.procedimentos_vinculados),
+        now
+      );
 
-    registrarAuditoria(db, {
-      usuario: getOperator(req),
-      acao: 'CRIACAO_PROFISSIONAL',
-      entidade: 'profissionais',
-      entidade_id: id,
-      detalhes: { nome: d.nome, especialidade: d.especialidade },
-    });
+      registrarAuditoria(db, {
+        usuario: getOperator(req),
+        acao: 'CRIACAO_PROFISSIONAL',
+        entidade: 'profissionais',
+        entidade_id: id,
+        detalhes: { nome: d.nome, especialidade: d.especialidade },
+      });
+    })();
 
     res.status(201).json({ id, clinica_id: CLINICA_PADRAO_ID, ...d, created_at: now, deleted_at: null });
   });
@@ -312,28 +420,30 @@ async function startServer() {
         : existing.procedimentos_vinculados,
     };
 
-    db.prepare(
-      `UPDATE profissionais SET nome = ?, cpf = ?, registro_conselho = ?, especialidade = ?, status = ?, procedimentos_vinculados = ? WHERE id = ?`
-    ).run(
-      updated.nome,
-      updated.cpf,
-      updated.registro_conselho,
-      updated.especialidade,
-      updated.status,
-      updated.procedimentos_vinculados,
-      req.params.id
-    );
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE profissionais SET nome = ?, cpf = ?, registro_conselho = ?, especialidade = ?, status = ?, procedimentos_vinculados = ? WHERE id = ?`
+      ).run(
+        updated.nome,
+        updated.cpf,
+        updated.registro_conselho,
+        updated.especialidade,
+        updated.status,
+        updated.procedimentos_vinculados,
+        req.params.id
+      );
 
-    registrarAuditoria(db, {
-      usuario: getOperator(req),
-      acao:
-        d.status && d.status !== existing.status
-          ? `STATUS_PROFISSIONAL_${d.status.toUpperCase()}`
-          : 'ATUALIZACAO_PROFISSIONAL',
-      entidade: 'profissionais',
-      entidade_id: req.params.id,
-      detalhes: { nome: updated.nome, status: updated.status },
-    });
+      registrarAuditoria(db, {
+        usuario: getOperator(req),
+        acao:
+          d.status && d.status !== existing.status
+            ? `STATUS_PROFISSIONAL_${d.status.toUpperCase()}`
+            : 'ATUALIZACAO_PROFISSIONAL',
+        entidade: 'profissionais',
+        entidade_id: req.params.id,
+        detalhes: { nome: updated.nome, status: updated.status },
+      });
+    })();
 
     res.json({
       ...existing,
@@ -349,15 +459,17 @@ async function startServer() {
     if (!existing) return res.status(404).json({ error: 'Profissional não encontrado' });
 
     const now = new Date().toISOString();
-    db.prepare(`UPDATE profissionais SET deleted_at = ?, status = 'inativo' WHERE id = ?`).run(now, req.params.id);
+    db.transaction(() => {
+      db.prepare(`UPDATE profissionais SET deleted_at = ?, status = 'inativo' WHERE id = ?`).run(now, req.params.id);
 
-    registrarAuditoria(db, {
-      usuario: getOperator(req),
-      acao: 'SOFT_DELETE_PROFISSIONAL',
-      entidade: 'profissionais',
-      entidade_id: req.params.id,
-      detalhes: { nome: existing.nome, deleted_at: now },
-    });
+      registrarAuditoria(db, {
+        usuario: getOperator(req),
+        acao: 'SOFT_DELETE_PROFISSIONAL',
+        entidade: 'profissionais',
+        entidade_id: req.params.id,
+        detalhes: { nome: existing.nome, deleted_at: now },
+      });
+    })();
 
     res.json({ ok: true, deleted_at: now });
   });
@@ -396,28 +508,30 @@ async function startServer() {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
     const d = parsed.data;
-    db.prepare(
-      `INSERT INTO clientes (id, clinica_id, nome, whatsapp, nascimento, lgpd_consentimento, lgpd_consentimento_em, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      id,
-      CLINICA_PADRAO_ID,
-      d.nome,
-      d.whatsapp,
-      d.nascimento,
-      d.lgpd_consentimento ? 1 : 0,
-      now,
-      d.status,
-      now
-    );
+    db.transaction(() => {
+      db.prepare(
+        `INSERT INTO clientes (id, clinica_id, nome, whatsapp, nascimento, lgpd_consentimento, lgpd_consentimento_em, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        id,
+        CLINICA_PADRAO_ID,
+        d.nome,
+        d.whatsapp,
+        d.nascimento,
+        d.lgpd_consentimento ? 1 : 0,
+        now,
+        d.status,
+        now
+      );
 
-    registrarAuditoria(db, {
-      usuario: getOperator(req),
-      acao: 'CRIACAO_CLIENTE',
-      entidade: 'clientes',
-      entidade_id: id,
-      detalhes: { nome: d.nome, lgpd_consentimento: d.lgpd_consentimento },
-    });
+      registrarAuditoria(db, {
+        usuario: getOperator(req),
+        acao: 'CRIACAO_CLIENTE',
+        entidade: 'clientes',
+        entidade_id: id,
+        detalhes: { nome: d.nome, lgpd_consentimento: d.lgpd_consentimento },
+      });
+    })();
 
     res.status(201).json({
       id,
@@ -449,17 +563,19 @@ async function startServer() {
       status: d.status ?? existing.status,
     };
 
-    db.prepare(
-      `UPDATE clientes SET nome = ?, whatsapp = ?, nascimento = ?, lgpd_consentimento = ?, status = ? WHERE id = ?`
-    ).run(updated.nome, updated.whatsapp, updated.nascimento, updated.lgpd_consentimento, updated.status, req.params.id);
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE clientes SET nome = ?, whatsapp = ?, nascimento = ?, lgpd_consentimento = ?, status = ? WHERE id = ?`
+      ).run(updated.nome, updated.whatsapp, updated.nascimento, updated.lgpd_consentimento, updated.status, req.params.id);
 
-    registrarAuditoria(db, {
-      usuario: getOperator(req),
-      acao: d.status && d.status !== existing.status ? `STATUS_CLIENTE_${d.status.toUpperCase()}` : 'ATUALIZACAO_CLIENTE',
-      entidade: 'clientes',
-      entidade_id: req.params.id,
-      detalhes: { nome: updated.nome, status: updated.status },
-    });
+      registrarAuditoria(db, {
+        usuario: getOperator(req),
+        acao: d.status && d.status !== existing.status ? `STATUS_CLIENTE_${d.status.toUpperCase()}` : 'ATUALIZACAO_CLIENTE',
+        entidade: 'clientes',
+        entidade_id: req.params.id,
+        detalhes: { nome: updated.nome, status: updated.status },
+      });
+    })();
 
     res.json({
       ...existing,
@@ -475,15 +591,17 @@ async function startServer() {
     if (!existing) return res.status(404).json({ error: 'Cliente não encontrado' });
 
     const now = new Date().toISOString();
-    db.prepare(`UPDATE clientes SET deleted_at = ?, status = 'inativo' WHERE id = ?`).run(now, req.params.id);
+    db.transaction(() => {
+      db.prepare(`UPDATE clientes SET deleted_at = ?, status = 'inativo' WHERE id = ?`).run(now, req.params.id);
 
-    registrarAuditoria(db, {
-      usuario: getOperator(req),
-      acao: 'SOFT_DELETE_CLIENTE_LGPD',
-      entidade: 'clientes',
-      entidade_id: req.params.id,
-      detalhes: { nome: existing.nome, deleted_at: now },
-    });
+      registrarAuditoria(db, {
+        usuario: getOperator(req),
+        acao: 'SOFT_DELETE_CLIENTE_LGPD',
+        entidade: 'clientes',
+        entidade_id: req.params.id,
+        detalhes: { nome: existing.nome, deleted_at: now },
+      });
+    })();
 
     res.json({ ok: true, deleted_at: now });
   });
@@ -517,18 +635,20 @@ async function startServer() {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
     const d = parsed.data;
-    db.prepare(
-      `INSERT INTO procedimentos (id, clinica_id, nome, duracao_min, valor, orientacoes, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(id, CLINICA_PADRAO_ID, d.nome, d.duracao_min, d.valor, d.orientacoes, d.status, now);
+    db.transaction(() => {
+      db.prepare(
+        `INSERT INTO procedimentos (id, clinica_id, nome, duracao_min, valor, orientacoes, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(id, CLINICA_PADRAO_ID, d.nome, d.duracao_min, d.valor, d.orientacoes, d.status, now);
 
-    registrarAuditoria(db, {
-      usuario: getOperator(req),
-      acao: 'CRIACAO_PROCEDIMENTO',
-      entidade: 'procedimentos',
-      entidade_id: id,
-      detalhes: { nome: d.nome, duracao_min: d.duracao_min, valor: d.valor },
-    });
+      registrarAuditoria(db, {
+        usuario: getOperator(req),
+        acao: 'CRIACAO_PROCEDIMENTO',
+        entidade: 'procedimentos',
+        entidade_id: id,
+        detalhes: { nome: d.nome, duracao_min: d.duracao_min, valor: d.valor },
+      });
+    })();
 
     res.status(201).json({ id, clinica_id: CLINICA_PADRAO_ID, ...d, created_at: now, deleted_at: null });
   });
@@ -552,20 +672,22 @@ async function startServer() {
       status: d.status ?? existing.status,
     };
 
-    db.prepare(
-      `UPDATE procedimentos SET nome = ?, duracao_min = ?, valor = ?, orientacoes = ?, status = ? WHERE id = ?`
-    ).run(updated.nome, updated.duracao_min, updated.valor, updated.orientacoes, updated.status, req.params.id);
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE procedimentos SET nome = ?, duracao_min = ?, valor = ?, orientacoes = ?, status = ? WHERE id = ?`
+      ).run(updated.nome, updated.duracao_min, updated.valor, updated.orientacoes, updated.status, req.params.id);
 
-    registrarAuditoria(db, {
-      usuario: getOperator(req),
-      acao:
-        d.status && d.status !== existing.status
-          ? `STATUS_PROCEDIMENTO_${d.status.toUpperCase()}`
-          : 'ATUALIZACAO_PROCEDIMENTO',
-      entidade: 'procedimentos',
-      entidade_id: req.params.id,
-      detalhes: { nome: updated.nome, status: updated.status },
-    });
+      registrarAuditoria(db, {
+        usuario: getOperator(req),
+        acao:
+          d.status && d.status !== existing.status
+            ? `STATUS_PROCEDIMENTO_${d.status.toUpperCase()}`
+            : 'ATUALIZACAO_PROCEDIMENTO',
+        entidade: 'procedimentos',
+        entidade_id: req.params.id,
+        detalhes: { nome: updated.nome, status: updated.status },
+      });
+    })();
 
     res.json({ ...existing, ...updated });
   });
@@ -577,15 +699,17 @@ async function startServer() {
     if (!existing) return res.status(404).json({ error: 'Procedimento não encontrado' });
 
     const now = new Date().toISOString();
-    db.prepare(`UPDATE procedimentos SET deleted_at = ?, status = 'inativo' WHERE id = ?`).run(now, req.params.id);
+    db.transaction(() => {
+      db.prepare(`UPDATE procedimentos SET deleted_at = ?, status = 'inativo' WHERE id = ?`).run(now, req.params.id);
 
-    registrarAuditoria(db, {
-      usuario: getOperator(req),
-      acao: 'SOFT_DELETE_PROCEDIMENTO',
-      entidade: 'procedimentos',
-      entidade_id: req.params.id,
-      detalhes: { nome: existing.nome, deleted_at: now },
-    });
+      registrarAuditoria(db, {
+        usuario: getOperator(req),
+        acao: 'SOFT_DELETE_PROCEDIMENTO',
+        entidade: 'procedimentos',
+        entidade_id: req.params.id,
+        detalhes: { nome: existing.nome, deleted_at: now },
+      });
+    })();
 
     res.json({ ok: true, deleted_at: now });
   });
@@ -597,8 +721,8 @@ async function startServer() {
     const procedimentoId = String(req.query.procedimento_id ?? '');
     const data = String(req.query.data ?? '');
 
-    if (!profissionalId || !localId || !procedimentoId || !/^\d{4}-\d{2}-\d{2}$/.test(data)) {
-      return res.status(400).json({ error: 'Parâmetros obrigatórios: profissional_id, local_id, procedimento_id e data' });
+    if (!profissionalId || !localId || !procedimentoId || !isValidCalendarDate(data)) {
+      return res.status(400).json({ error: 'Parâmetros obrigatórios: profissional_id, local_id, procedimento_id e data válida (YYYY-MM-DD)' });
     }
 
     const proc = db
@@ -623,6 +747,10 @@ async function startServer() {
     }
     if (proc.status !== 'ativo') {
       return res.json({ slots: [], motivo: 'Procedimento inativo' });
+    }
+    const vinculados = JSON.parse(prof.procedimentos_vinculados || '[]') as string[];
+    if (vinculados.length > 0 && !vinculados.includes(procedimentoId)) {
+      return res.json({ slots: [], motivo: 'Procedimento não vinculado a este profissional' });
     }
 
     const horario = JSON.parse(local.horario_func) as {
@@ -740,13 +868,29 @@ async function startServer() {
 
     const rows = db.prepare(query).all(...params) as Array<Record<string, any>>;
 
-    const extrasStmt = db.prepare(
-      `SELECT * FROM atendimento_procedimentos_extras WHERE agendamento_id = ? ORDER BY created_at ASC`
-    );
+    const extrasByAgendamento = new Map<string, Array<Record<string, any>>>();
+    if (rows.length > 0) {
+      const ids = rows.map((r) => String(r.id));
+      const placeholders = ids.map(() => '?').join(',');
+      const allExtras = db
+        .prepare(
+          `SELECT * FROM atendimento_procedimentos_extras
+           WHERE agendamento_id IN (${placeholders})
+           ORDER BY created_at ASC`
+        )
+        .all(...ids) as Array<Record<string, any>>;
+
+      for (const ext of allExtras) {
+        const key = String(ext.agendamento_id);
+        const list = extrasByAgendamento.get(key) ?? [];
+        list.push(ext);
+        extrasByAgendamento.set(key, list);
+      }
+    }
 
     const enriched = rows.map((row) => ({
       ...row,
-      extras: extrasStmt.all(row.id),
+      extras: extrasByAgendamento.get(String(row.id)) ?? [],
     }));
 
     res.json(enriched);
@@ -780,6 +924,11 @@ async function startServer() {
         .get(d.profissional_id) as { id: string; nome: string; procedimentos_vinculados: string } | undefined;
       if (!prof) {
         return { error: 'Profissional não encontrado ou inativo.', status: 404 as const };
+      }
+
+      const vinculados = JSON.parse(prof.procedimentos_vinculados || '[]') as string[];
+      if (vinculados.length > 0 && !vinculados.includes(d.procedimento_id)) {
+        return { error: 'Este procedimento não está vinculado ao profissional selecionado.', status: 400 as const };
       }
 
       const local = db
@@ -934,15 +1083,50 @@ async function startServer() {
     if (!existing) return res.status(404).json({ error: 'Agendamento não encontrado' });
 
     const newStatus = parsed.data.status;
-    db.prepare(`UPDATE agendamentos SET status = ? WHERE id = ?`).run(newStatus, req.params.id);
+    const statusTx = db.transaction(() => {
+      if (existing.status === 'cancelado' && newStatus !== 'cancelado') {
+        const conflito = db
+          .prepare(
+            `SELECT id FROM agendamentos
+             WHERE id != ?
+               AND deleted_at IS NULL
+               AND status != 'cancelado'
+               AND (profissional_id = ? OR local_id = ?)
+               AND data_hora_inicio < ?
+               AND data_hora_fim > ?`
+          )
+          .get(
+            existing.id,
+            existing.profissional_id,
+            existing.local_id,
+            existing.data_hora_fim,
+            existing.data_hora_inicio
+          );
+        if (conflito) {
+          return {
+            error: 'Erro ao validar disponibilidade. O horário já foi ocupado após o cancelamento.',
+            status: 409 as const,
+          };
+        }
+      }
 
-    registrarAuditoria(db, {
-      usuario: getOperator(req),
-      acao: `STATUS_AGENDAMENTO_${newStatus.toUpperCase()}`,
-      entidade: 'agendamentos',
-      entidade_id: req.params.id,
-      detalhes: { anterior: existing.status, novo: newStatus },
+      db.prepare(`UPDATE agendamentos SET status = ? WHERE id = ?`).run(newStatus, req.params.id);
+
+      registrarAuditoria(db, {
+        usuario: getOperator(req),
+        acao: `STATUS_AGENDAMENTO_${newStatus.toUpperCase()}`,
+        entidade: 'agendamentos',
+        entidade_id: req.params.id,
+        detalhes: { anterior: existing.status, novo: newStatus },
+      });
+
+      return { ok: true as const };
     });
+
+    const statusResult = statusTx();
+    if ('error' in statusResult && statusResult.error) {
+      return res.status(statusResult.status ?? 409).json({ error: statusResult.error });
+    }
 
     res.json({ ok: true, status: newStatus });
   });
@@ -981,6 +1165,14 @@ async function startServer() {
       }
 
       const d = parsed.data;
+      if (d.procedimento_id) {
+        const procExists = db
+          .prepare(`SELECT id FROM procedimentos WHERE id = ? AND deleted_at IS NULL`)
+          .get(d.procedimento_id);
+        if (!procExists) {
+          return { error: 'Procedimento extra informado não existe no catálogo.', status: 404 as const };
+        }
+      }
       const now = new Date().toISOString();
       const extraId = crypto.randomUUID();
       const operator = getOperator(req);
@@ -1258,9 +1450,8 @@ async function startServer() {
   app.get('/api/relatorios', (req, res) => {
     const rawFrom = String(req.query.from ?? '2000-01-01');
     const rawTo = String(req.query.to ?? '2099-12-31');
-    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
-    if (!dateRegex.test(rawFrom) || !dateRegex.test(rawTo)) {
-      return res.status(400).json({ error: 'Parâmetros from e to devem estar no formato YYYY-MM-DD.' });
+    if (!isValidCalendarDate(rawFrom) || !isValidCalendarDate(rawTo)) {
+      return res.status(400).json({ error: 'Parâmetros from e to devem ser datas válidas no formato YYYY-MM-DD.' });
     }
     const from = rawFrom;
     const to = rawTo;
@@ -1374,8 +1565,11 @@ async function startServer() {
     res.json(rows);
   });
 
-  // Error handler
-  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+  // Error handler (including malformed JSON payloads)
+  app.use((err: Error & { status?: number; type?: string }, _req: Request, res: Response, _next: NextFunction) => {
+    if (err instanceof SyntaxError && (err.status === 400 || err.type === 'entity.parse.failed')) {
+      return res.status(400).json({ error: 'JSON inválido no corpo da requisição.' });
+    }
     console.error('[AgendaFlex API Error]', err);
     res.status(500).json({ error: 'Erro interno no servidor.' });
   });

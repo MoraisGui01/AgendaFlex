@@ -4,9 +4,11 @@ import {
   BarChart3,
   Building2,
   CalendarDays,
+  ChevronDown,
   ChevronRight,
   ClipboardList,
   LayoutDashboard,
+  LogOut,
   Menu,
   MessageSquare,
   ShieldCheck,
@@ -15,8 +17,15 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/src/components/ui/select';
-import { getCurrentOperator, setCurrentOperator } from '@/src/lib/api';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/src/components/ui/dropdown-menu';
+import { useAuth } from '@/src/contexts/AuthContext';
 import { cn } from '@/src/lib/utils';
 import { WhatsAppPanelDialog } from './WhatsAppPanelDialog';
 
@@ -66,20 +75,61 @@ interface AppShellProps {
   children: React.ReactNode;
 }
 
+function getInitials(name: string | null | undefined, email: string | null | undefined): string {
+  const source = (name || email || 'U').trim();
+  const parts = source.split(/\s+/);
+  if (parts.length >= 2) {
+    return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
+  }
+  return source.slice(0, 2).toUpperCase();
+}
+
 export function AppShell({ currentRoute, onNavigate, onRefreshTrigger, children }: AppShellProps) {
   const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
   const [whatsappOpen, setWhatsappOpen] = React.useState(false);
-  const [operator, setOperator] = React.useState(getCurrentOperator());
-
-  const handleOperatorChange = (val: string) => {
-    setOperator(val);
-    setCurrentOperator(val);
-  };
+  const [avatarError, setAvatarError] = React.useState(false);
+  const { user, signOutUser } = useAuth();
 
   const breadcrumbs = ROUTE_BREADCRUMBS[currentRoute] ?? ['Administração'];
+  const displayName = user?.displayName || user?.email?.split('@')[0] || 'Operador';
+  const email = user?.email || '';
+  const initials = getInitials(user?.displayName, user?.email);
+
+  React.useEffect(() => {
+    setAvatarError(false);
+  }, [user?.photoURL]);
+
+  const handleLogoff = async () => {
+    setMobileMenuOpen(false);
+    await signOutUser();
+  };
+
+  const renderAvatar = (sizeClass = 'h-8 w-8 text-xs') => {
+    if (user?.photoURL && !avatarError) {
+      return (
+        <img
+          src={user.photoURL}
+          alt={displayName}
+          onError={() => setAvatarError(true)}
+          referrerPolicy="no-referrer"
+          className={cn(sizeClass, 'rounded-full object-cover border border-slate-200 shrink-0')}
+        />
+      );
+    }
+    return (
+      <span
+        className={cn(
+          sizeClass,
+          'inline-flex items-center justify-center rounded-full bg-[#1E3A8A] text-white font-semibold shrink-0'
+        )}
+      >
+        {initials}
+      </span>
+    );
+  };
 
   const renderNavLinks = (isMobile = false) => (
-    <div className="flex flex-col gap-6 px-3 py-5">
+    <div className="flex flex-col h-full gap-6 px-3 py-5">
       {(['Operação', 'Cadastros'] as const).map((group) => (
         <div key={group} className="space-y-1.5">
           <p className="px-3 text-xs font-semibold text-slate-400">{group}</p>
@@ -116,14 +166,25 @@ export function AppShell({ currentRoute, onNavigate, onRefreshTrigger, children 
         </div>
       ))}
 
-      <div className="mt-auto border-t border-slate-100 pt-4 px-2">
-        <div className="flex items-center gap-2 text-xs font-semibold text-slate-800">
-          <ShieldCheck className="h-4 w-4 text-[#1E3A8A] shrink-0" />
-          <span>Ambiente LGPD Ativo</span>
+      <div className="mt-auto space-y-3 border-t border-slate-100 pt-4 px-2">
+        <div>
+          <div className="flex items-center gap-2 text-xs font-semibold text-slate-800">
+            <ShieldCheck className="h-4 w-4 text-[#1E3A8A] shrink-0" />
+            <span>Ambiente LGPD Ativo</span>
+          </div>
+          <p className="mt-1 text-xs leading-relaxed text-slate-500">
+            RLS por clínica, exclusão lógica e trilha de auditoria em tempo real.
+          </p>
         </div>
-        <p className="mt-1 text-xs leading-relaxed text-slate-500">
-          RLS por clínica, exclusão lógica e trilha de auditoria em tempo real.
-        </p>
+
+        <button
+          type="button"
+          onClick={() => void handleLogoff()}
+          className="flex min-h-[44px] w-full items-center gap-2.5 rounded-lg border border-slate-200 bg-slate-50/70 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-red-50 hover:text-red-700 hover:border-red-200 transition-colors cursor-pointer"
+        >
+          <LogOut className="h-4 w-4 shrink-0" />
+          <span>Sair da conta (Logoff)</span>
+        </button>
       </div>
     </div>
   );
@@ -179,7 +240,7 @@ export function AppShell({ currentRoute, onNavigate, onRefreshTrigger, children 
 
       {/* Conteúdo Principal */}
       <div className="flex-1 flex flex-col min-w-0 lg:pl-64">
-        <header className="sticky top-0 z-20 flex h-16 items-center justify-between gap-4 border-b border-slate-200 bg-white/95 backdrop-blur-xs px-4 sm:px-6 lg:px-8">
+        <header className="sticky top-0 z-20 flex h-16 items-center justify-between gap-3 border-b border-slate-200 bg-white/95 backdrop-blur-xs px-4 sm:px-6 lg:px-8">
           <div className="flex items-center gap-2.5 min-w-0">
             <button
               type="button"
@@ -221,7 +282,7 @@ export function AppShell({ currentRoute, onNavigate, onRefreshTrigger, children 
             </nav>
           </div>
 
-          <div className="flex items-center gap-2.5 shrink-0">
+          <div className="flex items-center gap-2 shrink-0">
             <button
               type="button"
               onClick={() => setWhatsappOpen(true)}
@@ -232,18 +293,55 @@ export function AppShell({ currentRoute, onNavigate, onRefreshTrigger, children 
               <span className="sm:hidden">WhatsApp</span>
             </button>
 
-            <div className="hidden md:block w-56">
-              <Select value={operator} onValueChange={handleOperatorChange}>
-                <SelectTrigger className="min-h-[44px] text-xs" aria-label="Operador ativo para auditoria">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="Dra. Camila Mendes (Admin)">Dra. Camila Mendes (Admin)</SelectItem>
-                  <SelectItem value="Dra. Helena Vasconcelos">Dra. Helena Vasconcelos</SelectItem>
-                  <SelectItem value="Recepção Central">Recepção Central</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label="Conta Google conectada"
+                  className="inline-flex min-h-[44px] items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-left hover:bg-slate-50 hover:border-slate-300 transition-colors cursor-pointer"
+                >
+                  {renderAvatar('h-7 w-7 text-[11px]')}
+                  <div className="hidden md:block max-w-[160px] min-w-0">
+                    <p className="truncate text-xs font-semibold text-slate-900 leading-tight">
+                      {displayName}
+                    </p>
+                    {email ? (
+                      <p className="truncate text-[11px] text-slate-500 leading-tight">{email}</p>
+                    ) : null}
+                  </div>
+                  <ChevronDown className="h-3.5 w-3.5 text-slate-400 shrink-0" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-64">
+                <DropdownMenuLabel className="font-normal">
+                  <div className="flex items-center gap-2.5 py-1">
+                    {renderAvatar('h-9 w-9 text-xs')}
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-semibold text-slate-900">{displayName}</p>
+                      <p className="truncate text-xs text-slate-500">{email || 'Conta Google'}</p>
+                    </div>
+                  </div>
+                </DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onSelect={() => void handleLogoff()}
+                  className="min-h-[44px] text-red-600 focus:text-red-700 focus:bg-red-50 font-medium cursor-pointer"
+                >
+                  <LogOut className="h-4 w-4 mr-2" />
+                  <span>Sair da conta (Logoff)</span>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
+            <button
+              type="button"
+              onClick={() => void handleLogoff()}
+              title="Encerrar sessão (Logoff)"
+              className="hidden sm:inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-red-50 hover:text-red-700 hover:border-red-200 transition-colors cursor-pointer"
+            >
+              <LogOut className="h-4 w-4 shrink-0" />
+              <span>Sair</span>
+            </button>
           </div>
         </header>
 

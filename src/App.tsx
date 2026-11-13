@@ -4,7 +4,10 @@
  */
 import * as React from 'react';
 import { Toaster } from 'sonner';
+import { Stethoscope } from 'lucide-react';
 import { AppShell, type AppRoute } from '@/src/components/layout/AppShell';
+import { Skeleton } from '@/src/components/ui/skeleton';
+import { AuthProvider, useAuth } from '@/src/contexts/AuthContext';
 import { AdminOverviewPage } from '@/src/pages/AdminOverviewPage';
 import { AgendaPage } from '@/src/pages/AgendaPage';
 import { AtendimentoPage } from '@/src/pages/AtendimentoPage';
@@ -14,6 +17,7 @@ import {
   ProcedimentosPage,
   ProfissionaisPage,
 } from '@/src/pages/CadastrosPages';
+import { LoginPage } from '@/src/pages/LoginPage';
 import { RelatoriosPage } from '@/src/pages/RelatoriosPage';
 
 const VALID_ROUTES: AppRoute[] = [
@@ -34,7 +38,8 @@ function resolveRouteFromPath(pathname: string): AppRoute {
   return '/admin';
 }
 
-export default function App() {
+function AuthenticatedApp() {
+  const { user, loading } = useAuth();
   const [route, setRoute] = React.useState<AppRoute>(() =>
     resolveRouteFromPath(window.location.pathname)
   );
@@ -63,6 +68,29 @@ export default function App() {
     },
     [navigate]
   );
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-[#F8FAFC] flex items-center justify-center px-4">
+        <div className="w-full max-w-sm rounded-xl border border-slate-200 bg-white p-6 shadow-sm space-y-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#1E3A8A] text-white">
+              <Stethoscope className="h-5 w-5" />
+            </div>
+            <div className="space-y-1.5 flex-1">
+              <Skeleton className="h-4 w-28" />
+              <Skeleton className="h-3 w-44" />
+            </div>
+          </div>
+          <Skeleton className="h-11 w-full" />
+        </div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <LoginPage />;
+  }
 
   const renderPage = () => {
     switch (route) {
@@ -111,15 +139,21 @@ export default function App() {
   };
 
   return (
-    <>
-      <AppShell
-        currentRoute={route}
-        onNavigate={navigate}
-        onRefreshTrigger={() => setRefreshSignal((s) => s + 1)}
-      >
-        {renderPage()}
-      </AppShell>
+    <AppShell
+      currentRoute={route}
+      onNavigate={navigate}
+      onRefreshTrigger={() => setRefreshSignal((s) => s + 1)}
+    >
+      {renderPage()}
+    </AppShell>
+  );
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <AuthenticatedApp />
       <Toaster position="top-right" richColors closeButton />
-    </>
+    </AuthProvider>
   );
 }

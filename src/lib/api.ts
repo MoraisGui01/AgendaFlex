@@ -1,3 +1,5 @@
+import { getFirebaseIdToken } from '@/src/lib/firebase';
+
 let currentOperatorName = 'Dra. Camila Mendes (Admin)';
 
 export function setCurrentOperator(name: string) {
@@ -9,16 +11,33 @@ export function getCurrentOperator(): string {
 }
 
 export async function apiFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
-  const headers = new Headers(options.headers);
-  if (!headers.has('Content-Type') && options.body) {
-    headers.set('Content-Type', 'application/json');
-  }
-  headers.set('X-Operator-Name', currentOperatorName);
+  const buildHeaders = (token: string | null) => {
+    const headers = new Headers(options.headers);
+    if (!headers.has('Content-Type') && options.body) {
+      headers.set('Content-Type', 'application/json');
+    }
+    if (token) {
+      headers.set('Authorization', `Bearer ${token}`);
+    }
+    headers.set('X-Operator-Name', currentOperatorName);
+    return headers;
+  };
 
-  const response = await fetch(url, {
+  let token = await getFirebaseIdToken(false);
+  let response = await fetch(url, {
     ...options,
-    headers,
+    headers: buildHeaders(token),
   });
+
+  if (response.status === 401) {
+    token = await getFirebaseIdToken(true);
+    if (token) {
+      response = await fetch(url, {
+        ...options,
+        headers: buildHeaders(token),
+      });
+    }
+  }
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
