@@ -1,0 +1,5 @@
+{
+  "name": "AgendaFlex",
+  "description": "Sistema de gestão de clínicas com agenda sem conflitos de horário, controle de atendimentos, relatórios e conformidade com a LGPD.",
+  "requestFramePermissions": []
+}
